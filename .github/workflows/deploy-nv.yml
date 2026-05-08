@@ -1,0 +1,78 @@
+name: Deploy Landing Page (N. Virginia)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: './package-lock.json'
+
+      - name: Install Dependencies & Build
+        run: |
+          npm ci
+          npx next build
+
+      - name: Zip Build Artifacts
+        run: |
+          zip -r landing-build.zip .next public package.json package-lock.json next.config.ts \
+            -x ".next/cache/*" ".next/dev/*" ".next/trace/*"
+
+      - name: Stop PM2 Before Transfer
+        uses: appleboy/ssh-action@v1.0.3
+        continue-on-error: true
+        with:
+          host: ${{ secrets.NV_FE_EC2_HOST }}
+          username: ${{ secrets.NV_FE_EC2_USER }}
+          key: ${{ secrets.NV_FE_EC2_SSH_KEY }}
+          script: pm2 stop versa-landing || true
+
+      - name: Copy Files to Lightsail
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.NV_FE_EC2_HOST }}
+          username: ${{ secrets.NV_FE_EC2_USER }}
+          key: ${{ secrets.NV_FE_EC2_SSH_KEY }}
+          source: "./landing-build.zip"
+          target: "/home/${{ secrets.NV_FE_EC2_USER }}/versa-landing-temp"
+
+      - name: Deploy on Lightsail
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.NV_FE_EC2_HOST }}
+          username: ${{ secrets.NV_FE_EC2_USER }}
+          key: ${{ secrets.NV_FE_EC2_SSH_KEY }}
+          script: |
+            mkdir -p /home/${{ secrets.NV_FE_EC2_USER }}/versa-landing
+            cd /home/${{ secrets.NV_FE_EC2_USER }}/versa-landing
+
+            mv /home/${{ secrets.NV_FE_EC2_USER }}/versa-landing-temp/landing-build.zip .
+            rm -rf /home/${{ secrets.NV_FE_EC2_USER }}/versa-landing-temp
+            unzip -o landing-build.zip
+            rm landing-build.zip
+
+            if [ ! -f /swapfile ]; then
+              sudo fallocate -l 2G /swapfile
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile
+            fi
+
+            npm ci --omit=dev
+
+            pm2 delete versa-landing || true
+            pm2 start npm --name "versa-landing" \
+              --cwd /home/${{ secrets.NV_FE_EC2_USER }}/versa-landing \
+              -- run start -- -p 3000
+            pm2 save
