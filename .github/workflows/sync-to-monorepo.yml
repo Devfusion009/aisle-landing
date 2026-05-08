@@ -1,0 +1,87 @@
+name: Sync to Monorepo
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  guard:
+    name: Check for sync loop
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: check
+        run: |
+          MSG=$(git log -1 --format='%s')
+          if echo "$MSG" | grep -qE '^sync: from monorepo'; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Skipping — this commit came from the monorepo sync."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  sync:
+    name: Push landing → monorepo/frontend/ (selected files)
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout aisle-landing
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone monorepo
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          gh auth setup-git
+          git clone https://github.com/slaughterhectic/Aisle.git /tmp/mono
+          cd /tmp/mono
+          git checkout ${{ github.ref_name }} 2>/dev/null || git checkout -b ${{ github.ref_name }}
+
+      - name: Sync landing files into monorepo frontend/
+        run: |
+          # Only sync the files that actually originated from the monorepo.
+          # Never overwrite frontend's layout.tsx, package.json, or providers.
+          rsync -a --delete \
+            src/features/landing/ \
+            /tmp/mono/frontend/src/features/landing/
+
+          rsync -a --delete \
+            src/i18n/ \
+            /tmp/mono/frontend/src/i18n/
+
+          cp src/components/brand/verse-logo.tsx \
+             /tmp/mono/frontend/src/components/brand/verse-logo.tsx
+
+          cp src/lib/utils.ts    /tmp/mono/frontend/src/lib/utils.ts
+          cp src/app/globals.css /tmp/mono/frontend/src/app/globals.css
+          cp next.config.ts      /tmp/mono/frontend/next.config.ts
+          cp postcss.config.mjs  /tmp/mono/frontend/postcss.config.mjs
+
+          rsync -a --delete \
+            --exclude='.git' \
+            public/ \
+            /tmp/mono/frontend/public/
+
+      - name: Commit and push to monorepo
+        working-directory: /tmp/mono
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No landing changes to sync to monorepo."
+          else
+            git commit -m "sync: from aisle-landing ${GITHUB_SHA::7} [${{ github.ref_name }}]"
+            git push origin ${{ github.ref_name }}
+          fi
